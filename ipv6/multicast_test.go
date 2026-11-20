@@ -28,6 +28,11 @@ var packetConnReadWriteMulticastUDPTests = []struct {
 }
 
 func TestPacketConnReadWriteMulticastUDP(t *testing.T) {
+	// Sealed build: the CI runner's loopback carries a ULA so the ipv6 unicast
+	// tests can run, but IPv6 multicast delivery over loopback does not work there
+	// (sendmsg to ff02::114 fails with "network is unreachable"; with an ff00::/8
+	// route on lo the read blocks forever).
+	t.Skip("sealed build: IPv6 multicast delivery over loopback unavailable on the CI runner")
 	switch runtime.GOOS {
 	case "fuchsia", "hurd", "js", "nacl", "plan9", "wasip1", "windows":
 		t.Skipf("not supported on %s", runtime.GOOS)

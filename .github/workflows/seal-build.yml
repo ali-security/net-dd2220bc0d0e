@@ -1,0 +1,163 @@
+name: seal-build
+
+# golang.org/x/net has no GitHub Actions CI upstream (it is tested on Go's LUCI
+# builders against the two supported Go releases). This workflow mirrors that:
+# `go build ./...` + `go test ./...` on Go 1.24 (go.mod's minimum) and Go 1.25,
+# and packs the module zip with golang.org/x/mod/zip.CreateFromDir.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build-test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    env:
+      GOTOOLCHAIN: local
+      # http2's synctest-based tests (transport_test.go, server_test.go, ...) are
+      # tagged `go1.25 || goexperiment.synctest`; enable the experiment on Go 1.24
+      # so that leg runs them too.
+      GOEXPERIMENT: ${{ startsWith(matrix.go, '1.24') && 'synctest' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Produce module zip
+        if: matrix.go == '1.24.x'
+        run: |
+          set -euxo pipefail
+          # Copy the module tree minus this seal workflow (upstream ships no .github/).
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper" "$RUNNER_TEMP/build_output"
+          rsync -a --exclude=.git --exclude=.github ./ "$RUNNER_TEMP/modsrc/"
+          cat > "$RUNNER_TEMP/zipper/main.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	"golang.org/x/mod/module"
+          	"golang.org/x/mod/zip"
+          )
+
+          func main() {
+          	m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          	f, err := os.Create(os.Args[4])
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer f.Close()
+          	if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+          		log.Fatal(err)
+          	}
+          	log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/zipper"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.45.0.zip" | tail -n 3
+
+      - name: Build
+        run: |
+          go version
+          go build ./...
+
+      - name: Prepare network for socket tests
+        run: |
+          set -eux
+          # Unprivileged ICMP sockets (icmp TestConcurrentNonPrivilegedListenPacket, ping subtests).
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          # IPv6 on loopback (ipv6 package tests probe ::1).
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo | grep -q '::1' || sudo ip -6 addr add ::1/128 dev lo
+          # ipv6 tests need nettest.RoutedInterface("ip6", FlagLoopback), i.e. a
+          # non-::1 routable IPv6 address on lo; give lo a ULA.
+          sudo ip -6 addr add fd00:5ea1::1/128 dev lo nodad
+          # Multicast-capable loopback (ipv4 multicast tests use nettest.RoutedInterface with FlagLoopback|FlagMulticast).
+          sudo ip link set lo multicast on
+          ip addr show dev lo
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            # nettest.TestableNetwork("ip4"/"ip6") is false unless uid 0, so the "IP"
+            # (raw IP) variants in icmp/ipv4/ipv6 only run as root; run those packages again as root.
+            echo "=== Privileged run of icmp, ipv4, ipv6 as root ==="
+            go test -v -exec sudo ./icmp/... ./ipv4/... ./ipv6/... 2>&1 | tee "$RUNNER_TEMP/priv.log"
+            # External-network test is opt-in via -extnet; the runner has internet access.
+            echo "=== Opt-in external network test (http2 -extnet) ==="
+            go test -v -run '^TestTransportExternal$' ./http2 -args -extnet 2>&1 | tee "$RUNNER_TEMP/ext.log"
+            # go test -v streams each test's t.Skip message under its "=== RUN/NAME" header,
+            # possibly well before the "--- SKIP" line; attribute the last message to the test.
+            skipreport() {
+              awk -v run="$1" '
+                /^=== (RUN|CONT|NAME|PAUSE)[[:space:]]/ { cur = $3; next }
+                /^[[:space:]]+[A-Za-z0-9_]+\.go:[0-9]+: / { if (cur != "") { r = $0; sub(/^[[:space:]]+/, "", r); why[cur] = r }; next }
+                /^[[:space:]]*--- SKIP: / { n = $3; printf "[%s] SKIP %s -- reason: %s\n", run, n, ((n in why) ? why[n] : "(no message)"); c++ }
+                END { if (!c) printf "[%s] no skipped tests\n", run }
+              ' "$2"
+            }
+            echo "=== Skipped tests and reasons ==="
+            skipreport unprivileged "$RUNNER_TEMP/full.log"
+            skipreport privileged "$RUNNER_TEMP/priv.log"
+            skipreport extnet "$RUNNER_TEMP/ext.log"
+            cat "$RUNNER_TEMP/priv.log" "$RUNNER_TEMP/ext.log" >> "$RUNNER_TEMP/full.log"
+            cat <<'EOF'
+          === Why the remaining skips are expected on linux/amd64 ===
+          - "not supported on linux/amd64" (icmp/ipv4/ipv6 raw-socket tests): nettest.SupportsRawSocket
+            opens socket(AF_INET|AF_INET6, SOCK_RAW, 0); Linux rejects protocol 0 for SOCK_RAW
+            (EPROTONOSUPPORT) even for root, so upstream's gate is always false on Linux.
+          - "not available on linux" / "not supported on linux": upstream platform switches in the tests.
+          - [unprivileged] "listen ip4:47 / ip6:47 ...: operation not permitted" (e.g.
+            TestPacketConnConcurrentReadWriteUnicast/IP): raw IP listeners need root; these run and
+            pass in the [privileged] run of icmp/ipv4/ipv6 above.
+          - [unprivileged] TestTransportExternal "skipping external network test": opt-in -extnet flag;
+            it runs and passes in the [extnet] run above.
+          - TestTransportRequestsStallAtServerLimit/HTTP2Config: upstream skips via reflection when
+            net/http.HTTP2Config lacks StrictMaxConcurrentRequests (added in Go 1.26).
+          - TestDiag "avoid external network": opt-in -diag flag pinging external hosts over ICMP;
+            GitHub-hosted (Azure) runners drop outbound ICMP.
+          - TestSlowIncrementalDecode: unconditional t.Skip in upstream hpack_test.go (TODO for -race).
+          - TestUDPSourceInvalid "linux: sending from invalid source succeeds": Linux kernel behaviour.
+          - ipv6 TestPacketConnReadWriteMulticastUDP: IPv6 multicast over loopback is unavailable on the runner.
+          - ipv4 TestPacketConnReadWriteMulticastUDP/addr=232.0.1.0:0 (source-specific multicast over lo):
+            blocks until the 10m timeout on a host with a routed eth0; the ASM 224.0.0.254 subtest runs.
+          EOF
+            awk '/^[[:space:]]*--- PASS/{p++} /^--- PASS/{tp++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++}
+              END{printf "TEST SUMMARY: %d passed (incl. subtests), %d top-level passed, %d failed, %d skipped\n", p, tp, f, s}' "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Upload module zip
+        if: matrix.go == '1.24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
