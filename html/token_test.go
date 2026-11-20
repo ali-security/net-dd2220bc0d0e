@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,59 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributeSanitizerConfusion(t *testing.T) {
+	// Browsers keep only the first of several attributes sharing an (ASCII
+	// case-insensitive) name. Keeping the later duplicates lets a sanitizer
+	// vet a harmless copy while the first, attacker-controlled value is what
+	// actually takes effect once the tree is rendered.
+	const src = `<a href="javascript:alert(1)" HREF="https://example.com/">x</a>`
+
+	doc, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	const want = `<html><head></head><body><a href="javascript:alert(1)">x</a></body></html>`
+	if got := buf.String(); got != want {
+		t.Errorf("Parse+Render:\ngot  %q\nwant %q", got, want)
+	}
+
+	z := NewTokenizer(strings.NewReader(src))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	var keys []string
+	for _, more := z.TagName(); more; {
+		var key []byte
+		key, _, more = z.TagAttr()
+		keys = append(keys, string(key))
+	}
+	if len(keys) != 1 || keys[0] != "href" {
+		t.Errorf("TagAttr keys: got %q, want [\"href\"]", keys)
+	}
+}
